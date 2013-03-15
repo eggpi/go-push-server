@@ -308,7 +308,9 @@ func pushHandler(ws *websocket.Conn) {
 	log.Println("Closing Websocket!")
 	ws.Close()
 
-	gServerState.ConnectedClients[client.UAID].Websocket = nil
+	if (gServerState.ConnectedClients[client.UAID] != nil) {
+		gServerState.ConnectedClients[client.UAID].Websocket = nil
+	}
 }
 
 func notifyHandler(w http.ResponseWriter, r *http.Request) {
