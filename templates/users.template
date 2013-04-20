@@ -26,12 +26,16 @@
 
 <script>
 
+navigator.mozSetMessageHandler('push', function(message) {
+  alert(message);
+}
+);
 
 function requestPush() {
-  var req = navigator.pushNotification.register();
+  var req = navigator.push.register();
 
   req.onsuccess = function(e) {
-    alert(e.target.result.pushEndpoint);
+    alert(e.target.result);
   }
 
   req.onerror = function(e) {
@@ -42,7 +46,7 @@ function requestPush() {
 function unregister(id) {
   var pushEndpoint = "{{.PushEndpointPrefix}}" + id;
 
-  var req = navigator.pushNotification.unregister(pushEndpoint);
+  var req = navigator.push.unregister(pushEndpoint);
 
   req.onsuccess = function(e) {
     alert("unregistered successful = " + id);
