@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"runtime"
 	"strings"
@@ -20,6 +21,7 @@ type ServerConfig struct {
 	Hostname     string `json:"hostname"`
 	Port         string `json:"port"`
 	NotifyPrefix string `json:"notifyPrefix"`
+	GroupPrefix  string `json:"groupPrefix"`
 	UseTLS       bool   `json:"useTLS"`
 	CertFilename string `json:"certFilename"`
 	KeyFilename  string `json:"keyFilename"`
@@ -42,6 +44,7 @@ type Channel struct {
 }
 
 type ChannelIDSet map[string]*Channel
+type GroupIDSet map[string][]*Channel
 
 type ServerState struct {
 	// Mapping from a UAID to the Client object
@@ -56,6 +59,9 @@ type ServerState struct {
 
 	// Mapping from a ChannelID to the cooresponding Channel
 	ChannelIDToChannel ChannelIDSet `json:"channelIDToChannel"`
+
+	// Mapping from a GroupID to the corresponding Channel
+	GroupIDToChannels GroupIDSet `json:"channelGroups"`
 }
 
 var gServerState ServerState
@@ -108,6 +114,7 @@ func openState() {
 	log.Println(" -> creating new server state")
 	gServerState.UAIDToChannelIDs = make(map[string]ChannelIDSet)
 	gServerState.ChannelIDToChannel = make(ChannelIDSet)
+	gServerState.GroupIDToChannels = make(GroupIDSet)
 	gServerState.ConnectedClients = make(map[string]*Client)
 }
 
@@ -133,6 +140,20 @@ func makeNotifyURL(suffix string) string {
 	}
 
 	return scheme + gServerConfig.Hostname + ":" + gServerConfig.Port + gServerConfig.NotifyPrefix + suffix
+}
+
+func getIDFromNotifyURL(url *url.URL) string {
+	return strings.Replace(url.Path, gServerConfig.NotifyPrefix, "", 1)
+}
+
+func getGroupIDAndActionFromGroupURL(url *url.URL) (groupID, action string) {
+	pieces := strings.Split(url.Path, "/")
+	if len(pieces) >= 2 {
+		action = pieces[len(pieces) - 2]
+		groupID = pieces[len(pieces) - 1]
+	}
+
+	return
 }
 
 func handleRegister(client *Client, f map[string]interface{}) {
@@ -366,6 +387,71 @@ func pushHandler(ws *websocket.Conn) {
 	}
 }
 
+func groupHandler(w http.ResponseWriter, r *http.Request) {
+	defer func() {
+		if err := recover(); err != nil {
+			log.Println(err)
+			w.WriteHeader(http.StatusBadRequest)
+
+			w.Write([]byte(err.(string)))
+		}
+	}()
+
+	log.Println("Got a group message from the app server ", r.URL)
+
+	if r.Method != "POST" {
+		panic("Request method must be POST")
+	}
+
+	groupID, action := getGroupIDAndActionFromGroupURL(r.URL)
+	if groupID == "" || action == "" {
+		panic("Malformed URL: group id is missing")
+	}
+
+	endpoint, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		panic("Failed to read request body")
+	}
+
+	endpointURL, err := url.Parse(string(endpoint))
+	if err != nil {
+		panic("Failed to parse client endpoint")
+	}
+
+	channelID := getIDFromNotifyURL(endpointURL)
+	if channel, found := gServerState.ChannelIDToChannel[channelID]; found {
+		switch action {
+		case "add":
+			gServerState.GroupIDToChannels[groupID] =
+				append(gServerState.GroupIDToChannels[groupID], channel)
+
+			log.Println("Added", channelID, "to group", groupID)
+		case "remove":
+			group := gServerState.GroupIDToChannels[groupID]
+			for i, c := range group {
+				if c.ChannelID == channel.ChannelID {
+					group[i], group[len(group)-1] = group[len(group)-1], group[i]
+					gServerState.GroupIDToChannels[groupID] =
+						group[:len(group)-1]
+					break
+				}
+			}
+
+			log.Println("Removed", channelID, "from group", groupID)
+		default:
+			panic("Malformed URL: expected either 'add' or 'remove'")
+		}
+
+		saveState()
+	} else {
+		panic("Unknown channel ID")
+	}
+
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(makeNotifyURL(groupID)))
+	return
+}
+
 func notifyHandler(w http.ResponseWriter, r *http.Request) {
 	log.Println("Got notification from app server ", r.URL)
 
@@ -376,25 +462,31 @@ func notifyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	channelID := strings.Replace(r.URL.Path, gServerConfig.NotifyPrefix, "", 1)
+	id := getIDFromNotifyURL(r.URL)
 
-	if strings.Contains(channelID, "/") {
-		log.Println("Could not find a valid channelID")
+	if strings.Contains(id, "/") {
+		log.Println("Could not find a valid channelID or groupID")
 		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte("Could not find a valid channelID."))
+		w.Write([]byte("Could not find a valid channelID or groupID."))
 		return
 	}
 
-	channel, found := gServerState.ChannelIDToChannel[channelID]
-	if !found {
-		log.Println("Could not find channel " + channelID)
+	var channels []*Channel
+	if channel, found := gServerState.ChannelIDToChannel[id]; found {
+		channels = append(channels, channel)
+	} else if group, found := gServerState.GroupIDToChannels[id]; found {
+		channels = group
+	} else {
+		log.Println("Could not find channel or group " + id)
 		return
 	}
-	channel.Version++
+
+	for _, c := range channels {
+		c.Version++
+		notifyChan <- Notification{c.UAID, c}
+	}
 
 	saveState()
-
-	notifyChan <- Notification{channel.UAID, channel}
 
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("OK"))
@@ -558,6 +650,7 @@ func main() {
 	http.Handle("/", websocket.Handler(pushHandler))
 
 	http.HandleFunc(gServerConfig.NotifyPrefix, notifyHandler)
+	http.HandleFunc(gServerConfig.GroupPrefix, groupHandler)
 
 	go deliverNotifications(notifyChan, ackChan)
 
