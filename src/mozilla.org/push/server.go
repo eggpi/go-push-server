@@ -390,7 +390,22 @@ func notifyHandler(w http.ResponseWriter, r *http.Request) {
 		log.Println("Could not find channel " + channelID)
 		return
 	}
-	channel.Version++
+
+	var version uint64
+	ret, err := fmt.Sscanf(r.FormValue("version"), "%d", &version)
+	if ret != 1 || err != nil {
+		log.Println("Could not parse version string: ", err)
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte("Could parse version string"))
+		return
+	}
+
+	if version < channel.Version {
+		// might be an old message, just ignore
+		return
+	}
+
+	channel.Version = version
 
 	saveState()
 
